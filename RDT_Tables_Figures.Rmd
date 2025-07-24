@@ -1,0 +1,864 @@
+---
+title: "Desale 2025 | Dengue RDT Evaluation Analysis"
+author: "Hans Desale"
+---
+# Introduction
+
+This repository contains the complete RMarkdown script for the evaluation of commercial dengue rapid diagnostic tests (RDTs) conducted by Hans Desale in 2024-2025.
+
+The analysis includes:
+- Sample selection and cleaning
+- Descriptive statistics
+- Performance analysis (sensitivity, specificity, percent agreement)
+- Serotype-specific sensitivity
+- Time-varying sensitivity modeling
+- DPO-adjusted sensitivity
+- Zika virus cross-reactivity evaluation
+
+**Data Availability:**  
+The raw data file `20250502_Master_File.xlsx` used in this analysis. 
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r load, eval=TRUE}
+
+library(tidyverse)
+library(readxl)
+library(gtsummary)
+library(gt)
+library(cowplot)
+library(binom) 
+library(ggplot2)
+library(dplyr)
+library(epitools)
+library(glue)
+
+raw_master_file <- read_excel("data/raw_data/20250502_Master_File.xlsx")
+       
+```
+
+## 1. Sample Selection and Cleaning
+
+To ensure a clean dataset for evaluation, we applied inclusion and exclusion criteria to the raw data. 
+Samples were classified based on RT-PCR, IgM ELISA, and NS1 ELISA results. 
+Samples with inconsistent results (3 samples removed because they tested equivocal for IgM upon retesting are not positive by any other dengue reference test) were flagged and removed. We retained n=197 samples for analysis.
+
+```{r selection, eval=TRUE}
+
+## Data cleaning and labeling
+
+# Create initial dataset with RT-PCR positivity and true status labels
+initial_process <- raw_master_file %>%
+  mutate(RT_PCR = ifelse(Lab_PCR == "pos", "Positive", "Negative")) %>%  # Recode Lab_PCR to RT_PCR
+  group_by(CUID) %>%
+  mutate(true_status = case_when(
+    any(RT_PCR == "Positive", IgM_ELISA == "Positive", NS1_ELISA == "Positive") ~ "DENV+",  # DENV+ if any test is positive
+    str_detect(Summary, "Zika") ~ "Zika+",  # Zika+ if summary contains "Zika"
+    .default = "Negative"  # Otherwise, Negative
+  )) %>%
+  mutate(weird = Lab_IgM == "pos" & true_status == "Negative") %>%  # Flag inconsistent positives
+  ungroup()
+
+## QC checks and summaries
+
+# View records that are "weird" – IgM positive but true_status is negative
+initial_process %>% filter(weird) %>%
+  select(CUID, Lab_IgM, IgM_ELISA, NS1_ELISA, RT_PCR)
+
+# Count number of samples that were Zika+
+initial_process %>%
+  filter(str_detect(Summary, "Zika")) %>%
+  nrow() %>% cat("Zika samples positive by RT-PCR")
+
+# Count DENV+ samples (excluding Zika)
+initial_process %>%
+  filter(!str_detect(Summary, "Zika")) %>%
+  filter(RT_PCR == "Positive" | NS1_ELISA == "Positive" | IgM_ELISA == "Positive") %>%
+  nrow() %>% cat("samples DENV positive by RT-PCR, NS1 ELISA or IgM ELISA")
+
+# Count samples that used to be IgM+ but are now equivocal
+initial_process %>%
+  filter(!str_detect(Summary, "Zika")) %>%
+  filter(!(RT_PCR == "Positive" | NS1_ELISA == "Positive" | IgM_ELISA == "Positive")) %>%
+  filter(Lab_IgM == "pos") %>%
+  nrow() %>% cat("samples removed as they used to be IgM positive but are now equivocal")
+
+# Count remaining true negatives (clean)
+initial_process %>%
+  filter(!str_detect(Summary, "Zika")) %>%
+  filter(!(RT_PCR == "Positive" | NS1_ELISA == "Positive" | IgM_ELISA == "Positive")) %>%
+  filter(!Lab_IgM == "pos") %>%
+  nrow() %>% cat("samples remain that are negative by RT-PCR, negative by NS1 ELISA, and either negative or equivocal by IgM ELISA")
+
+
+## Create final cleaned analytic dataset
+
+# Remove weird cases and drop the flag
+analytic_file <- filter(initial_process, !weird) %>% 
+  select(-weird)
+
+# Keep covariates for merging later
+covariates <- select(analytic_file, CUID, true_status, DPO, Age, Event, Serotype, IgM_ELISA, NS1_ELISA, RT_PCR)
+
+## Reshape the test results into long format
+
+# Gather individual test results into long format
+long_tests <- analytic_file %>%
+  select(CUID:Abbexa_NS1) %>%  # Select only test result columns
+  gather(test, result, -c(CUID)) %>%  # Convert wide to long
+  mutate(target = str_extract(test, "IgM|IgG|NS1|IgA")) %>%  # Extract target type
+  mutate(test = str_remove(test, "_IgM|_IgG|_NS1|_IgA")) %>%  # Clean test name
+  mutate(result = str_remove(result, "IgM |IgG |NS1 |IgA ")) %>%  # Clean result
+  filter(target %in% c("IgM", "NS1")) %>%  # Keep only IgM and NS1 tests
+  left_join(covariates)  # Join covariates back in
+
+## Flag invalid results and summarize
+
+# Preview invalid results
+long_tests %>% filter(result == "Invalid")
+
+# Count invalid results
+long_tests %>% filter(result == "Invalid") %>% nrow() %>%
+  cat(" Invalid results were ignored")
+
+## Collapse IgM/NS1 into a single test summary for "Overall"
+
+# Collapse tests by CUID and test into single result
+overall_test <- long_tests %>% 
+  filter(result != "Invalid") %>%
+  group_by(CUID, test) %>%
+  summarize(n = n(),
+            result = ifelse(any(result == "Positive"), "Positive", "Negative")) %>%
+  mutate(target = "Overall") %>%
+  ungroup() %>%
+  left_join(covariates)
+
+## Identify tests with both IgM and NS1 targets
+
+# Identify dual-target tests (i.e., those with both NS1 and IgM targets)
+dual_test <- overall_test %>% 
+  filter(n == 2) %>% 
+  distinct(test) %>% 
+  unlist() %>% 
+  as.character()
+
+## Create final results dataset including overall and separate targets
+
+final_results <- bind_rows(
+  overall_test %>% select(-n),  # Overall summaries
+  filter(long_tests, test %in% dual_test) %>% filter(result != "Invalid")  # Individual IgM/NS1 tests
+) %>%
+  mutate(RDT = glue::glue("{test} {target}")) %>%
+  mutate(RDT = str_remove(RDT, " Overall"))  # Clean label
+
+## Format test names for plotting
+
+# Create cleaned names for each RDT
+pretty_names <- distinct(final_results, RDT, target) %>%
+  bind_rows(data.frame(RDT = c("NS1 ELISA", "IgM ELISA"))) %>%
+  mutate(pretty_rdt_comp = str_replace(RDT, "Lum", "LumiQuick")) %>%
+  mutate(pretty_rdt_comp = str_replace(pretty_rdt_comp, "CD", "Creative Diagnostics")) %>%
+  mutate(pretty_rdt_comp = str_replace(pretty_rdt_comp, "MPBio", "MP Diagnostics")) %>%
+  mutate(pretty_rdt_comp = str_replace(pretty_rdt_comp, "CTK", "CTK Biotech")) %>%
+  mutate(pretty_rdt = str_remove(pretty_rdt_comp, " IgM| NS1")) %>%
+  mutate(pretty_rdt = factor(pretty_rdt, levels = c(
+    "CTK Biotech", "Artron", "LumiQuick", "Cortez",
+    "Creative Diagnostics", "MP Diagnostics",
+    "Abbexa", "Biopanda", "InBios", "Biocan",
+    "NS1 ELISA", "IgM ELISA"
+  )))
+
+## Assign colors and types to each RDT      
+
+pretty_colors <- final_results %>%
+  filter(target == "Overall") %>%
+  distinct(RDT) %>%
+  mutate(type = ifelse(RDT %in% c("Abbexa", "Biopanda", "InBios"), "NS1 Only", "Combo")) %>%
+  arrange(type, RDT) %>%
+  mutate(
+    label_fill = c(rep("#D92826", 7), rep("#2882B7", 3)),  # Red for combo, blue for NS1
+    label_color = "white"
+  ) %>%
+  mutate(graph_col = label_fill) %>%
+  bind_rows(data.frame(
+    RDT = c("NS1 ELISA", "IgM ELISA"),
+    type = "ELISA",
+    label_color = "black",
+    label_fill = "white",
+    graph_col = "black"
+  )) %>%
+  left_join(pretty_names) %>%
+  arrange(pretty_rdt)
+
+```
+
+## Table 1. Descriptive Statistics of samples
+
+We first summarized the demographic and clinical characteristics of the study samples.
+Samples were categorized based on their true infection status: DENV+, Zika+, or Negative.
+
+Table 1 shows key characteristics including:
+
+The reference test results leading to classification,
+
+Age groups,
+
+Serotype information (if available),
+
+Event origin (e.g., study cohort), and
+
+Days post onset (DPO) at the time of sample collection.
+
+```{r descriptive, eval=TRUE}
+
+table1 <- analytic_file %>%
+  
+  # Categorize how a sample was positive
+  mutate(positive_results = case_when(
+    RT_PCR == "Positive" & IgM_ELISA != "Positive" & NS1_ELISA != "Positive" ~ "RT-PCR only",
+    RT_PCR != "Positive" & IgM_ELISA == "Positive" & NS1_ELISA != "Positive" ~ "IgM ELISA only",
+    RT_PCR == "Positive" & IgM_ELISA == "Positive" & NS1_ELISA == "Positive" ~ "RT-PCR, IgM ELISA, and NS1 ELISA",
+    RT_PCR == "Positive" & IgM_ELISA == "Positive" & NS1_ELISA != "Positive" ~ "RT-PCR and IgM ELISA",
+    RT_PCR == "Positive" & IgM_ELISA != "Positive" & NS1_ELISA == "Positive" ~ "RT-PCR and NS1 ELISA"
+  )) %>%
+  
+  # Create age groups
+  mutate(`Age Group` = cut(Age, breaks = c(0, 5, 18, 50, Inf), right = FALSE)) %>%
+  
+  # Clean and bin days post onset (DPO)
+  mutate(DPO = as.numeric(DPO)) %>%
+  mutate(`Days post onset` = ifelse(DPO > 8, 8, DPO)) %>%
+  mutate(`Days post onset` = factor(`Days post onset`, labels = c(0:7, "8+"))) %>%
+  
+  # Select and rename variables for the table
+  select(
+    true_status,
+    `Positive Results` = positive_results,
+    Age,
+    `Age Group`,
+    Serotype,
+    Event,
+    `Days post onset`
+  ) %>%
+  
+  # Create summary table comparing variables by DENV/Zika/Negative status
+  tbl_summary(by = true_status)
+
+table1
+```
+
+## Table 2. Overall Sensitivity and Specificity Table
+
+This section presents the overall diagnostic performance of each rapid diagnostic test (RDT) compared to the reference standard.Results are shown as percentages along with an exact 95% confidence intervals (CIs) based on the binomial distribution. The tabulated results below were used to create Figure 1 in the manuscript. Figures were generated in GraphPad Prism by manually entering the sensitivity and specificity values from this table.
+
+For each RDT, we calculated:
+
+Sensitivity: the proportion of true DENV-positive samples that were correctly identified as positive.
+
+Specificity: the proportion of true negative samples that were correctly identified as negative.
+
+
+
+```{r senspec, eval=TRUE}
+# ---- OVERALL SENSITIVITY & SPECIFICITY (Target: "Overall") ----
+
+overall_t2 <- left_join(
+
+  # Sensitivity: proportion of DENV+ correctly identified
+  final_results %>%
+    filter(target == "Overall", true_status == "DENV+") %>%
+    group_by(RDT) %>%
+    summarise(TP = n(), pos = sum(result == "Positive")) %>%
+    mutate(ci = binom.exact(pos, TP)) %>%
+    mutate(
+      proportion = round(ci$proportion, 2) * 100,
+      lower = round(ci$lower, 2) * 100,
+      upper = round(ci$upper, 2) * 100,
+      Sensitivity = glue::glue("{proportion}% ({lower}-{upper})")
+    ) %>%
+    select(RDT, Sensitivity),
+
+  # Specificity: proportion of true negatives correctly identified
+  final_results %>%
+    filter(target == "Overall", true_status == "Negative") %>%
+    group_by(RDT) %>%
+    summarise(TN = n(), neg = sum(result == "Negative")) %>%
+    mutate(ci = binom.exact(neg, TN)) %>%
+    mutate(
+      proportion = round(ci$proportion, 2) * 100,
+      lower = round(ci$lower, 2) * 100,
+      upper = round(ci$upper, 2) * 100,
+      Specificity = glue::glue("{proportion}% ({lower}-{upper})")
+    ) %>%
+    select(RDT, Specificity),
+  
+  by = "RDT"
+)
+
+
+# ---- BREAKDOWN BY TARGET (IgM / NS1 / Overall) ----
+
+# Sensitivity
+sens <- final_results %>%
+  filter(true_status == "DENV+") %>%
+  group_by(target, RDT) %>%
+  summarise(TP = n(), pos = sum(result == "Positive"), .groups = "drop")
+
+sens_ci <- binom.exact(sens$pos, sens$TP)
+
+sens <- bind_cols(sens, sens_ci) %>%
+  mutate(
+    proportion = round(proportion, 2) * 100,
+    lower = round(lower, 2) * 100,
+    upper = round(upper, 2) * 100,
+    Sensitivity = glue::glue("{proportion}% ({lower}-{upper})")
+  ) %>%
+  select(target, RDT, Sensitivity)
+
+# Specificity
+spec <- final_results %>%
+  filter(true_status == "Negative") %>%
+  group_by(target, RDT) %>%
+  summarise(TN = n(), neg = sum(result == "Negative"), .groups = "drop")
+
+spec_ci <- binom.exact(spec$neg, spec$TN)
+
+spec <- bind_cols(spec, spec_ci) %>%
+  mutate(
+    proportion = round(proportion, 2) * 100,
+    lower = round(lower, 2) * 100,
+    upper = round(upper, 2) * 100,
+    Specificity = glue::glue("{proportion}% ({lower}-{upper})")
+  ) %>%
+  select(target, RDT, Specificity)
+
+# Join sensitivity and specificity by RDT + target
+target_breakdown_t2 <- left_join(sens, spec, by = c("target", "RDT"))
+
+# ---- OUTPUT BOTH ----
+
+# Display the 'overall' table with all rows visible
+DT::datatable(overall_t2, 
+              options = list(pageLength = nrow(overall_t2), scrollX = TRUE), 
+              caption = "Table: Overall Sensitivity and Specificity")
+
+# Display the 'target breakdown' table with all rows visible
+DT::datatable(target_breakdown_t2, 
+              options = list(pageLength = nrow(target_breakdown_t2), scrollX = TRUE), 
+              caption = "Table: Sensitivity and Specificity by Target")
+```
+## Sensitivity by Serotype
+In this section, we assess the sensitivity of each rapid diagnostic test (RDT) separately for each dengue virus (DENV) serotype (DEN-1, DEN-2, DEN-3, DEN-4). Only DENV-positive samples with a confirmed serotype result were included in this analysis. For each RDT and serotype, sensitivity was calculated as the proportion of serotype-positive samples that tested positive on the RDT, along with an exact 95% confidence interval (CI) based on the binomial distribution. The sensitivity results by serotype were summarized in Supplementary Table 2 of the manuscript. Figure 2 illustrating serotype-specific sensitivity were created in GraphPad Prism using the numerical outputs from this table.
+
+```{r serotype}
+
+# Filter for DENV+ samples with valid Serotype
+sensitivity_by_serotype <- final_results %>%
+  filter(true_status == "DENV+", !is.na(Serotype)) %>%
+  group_by(Serotype, RDT) %>%
+  summarise(
+    TP = n(),
+    pos = sum(result == "Positive"),
+    .groups = "drop"
+  ) %>%
+  mutate(ci = binom.exact(pos, TP)) %>%
+  mutate(
+    proportion = round(ci$proportion, 2) * 100,
+    lower = round(ci$lower, 2) * 100,
+    upper = round(ci$upper, 2) * 100,
+    Sensitivity = glue("{proportion}% ({lower}-{upper})")
+  ) %>%
+  select(Serotype, RDT, Sensitivity)
+
+# View the table
+DT::datatable(sensitivity_by_serotype, 
+              options = list(scrollX = TRUE), 
+              caption = "Table: Sensitivity by Serotype")
+```
+
+## Time-Varying Sensitivity
+To understand how the sensitivity of each rapid diagnostic test (RDT) changes over the course of illness, we modeled the probability of a positive test result as a function of days post onset (DPO) of symptoms. For each RDT, a logistic regression model with a natural spline term for DPO was fitted to the DENV-positive samples. This approach captures potential non-linear trends in sensitivity over time. The models were used to generate smooth sensitivity curves from DPO 0 to 7, with 95% confidence intervals around the fitted line.
+A facet plot, where each panel displays one RDT, grouped and color-coded based on target detection (NS1-only tests in blue, combo NS1/IgM tests in red). This figure was used in the main results section of the manuscript (Figure 3).
+
+```{r timevaryingsensitivity}
+
+outdata <- data.frame()
+
+for(i in unique(overall_test$test)){
+      
+      
+      fit_data <- overall_test %>% filter(true_status=="DENV+") %>%
+      mutate(DPO=as.numeric(DPO)) %>%
+      filter(DPO<8) %>%
+      filter(test==i) %>%
+      mutate(bin_result=ifelse(result=="Positive",
+                               1,0))
+
+      fit <- glm(formula = bin_result~splines::ns(DPO,3),
+                 data=fit_data,family = "binomial"
+                 )
+      
+      expit <- function(x) 1/(1+exp(-x)) 
+      
+      outdata <- bind_rows(outdata,
+                  data.frame(DPO=0:7) %>%
+                        bind_cols(as.data.frame(predict(fit,se.fit=TRUE,newdata=.))) %>%
+                        mutate(
+                              avg=expit(fit),
+                              lb=expit(fit-1.96*se.fit),
+                              ub=expit(fit+1.96*se.fit)) %>%
+            mutate(test=i))
+      
+      
+}
+
+# Define custom colors by test name
+color_map <- c(
+  "Abbexa" = "blue",
+  "Biopanda" = "blue",
+  "InBios" = "blue",
+  "Artron" = "red",
+  "CD" = "red",
+  "Cortez" = "red",
+  "CTK" = "red",
+  "Lum" = "red",
+  "MPBio" = "red", 
+  "Biocan" = "red"
+)
+
+label_map <- c(
+  "Abbexa" = "Abbexa",
+  "Biopanda" = "Biopanda",
+  "InBios" = "InBios",
+  "Artron" = "Artron",
+  "CD" = "Creative Diagnostics",
+  "Cortez" = "Cortez Diagnostics",
+  "CTK" = "CTK Biotech",
+  "Lum" = "LumiQuick",
+  "MPBio" = "MP Diagnostics", 
+  "Biocan" = "Biocan"
+)
+
+outdata <- outdata %>%
+  mutate(test_group = case_when(
+    test %in% c("Abbexa", "Biopanda", "InBios") ~ "NS1 only test",
+    test %in% c("Artron", "CD", "Cortez", "CTK", "Lum", "MPBio", "Biocan") ~ "NS1/IgM combo test",
+    TRUE ~ NA_character_
+  ))
+
+
+plot_data <- overall_test %>%
+  filter(true_status == "DENV+") %>%
+  mutate(DPO = as.numeric(DPO)) %>%
+  filter(DPO < 8) %>%
+  group_by(test, DPO) %>%
+  summarise(n = n(), avg = mean(result == "Positive"), .groups = "drop")
+
+desired_order <- c(
+  "Abbexa", "Biopanda", "InBios",
+  "Artron","Biocan", "Cortez", "CD", "CTK", "Lum", "MPBio"
+)
+
+outdata <- outdata %>%
+  mutate(test = factor(test, levels = desired_order))
+
+plot_data <- plot_data %>%
+  mutate(test = factor(test, levels = desired_order))
+
+
+ggplot(plot_data, aes(x = DPO, y = avg)) +
+        geom_ribbon(data = outdata,
+              aes(ymin = lb, ymax = ub),
+              fill = "black", alpha = 0.1)+
+  geom_line(data = outdata,
+            aes(color = test_group),
+            linewidth = 1) +
+  geom_point(aes(size = n), shape = 1) +
+  facet_wrap(~test, labeller = labeller(test = label_map)) +
+  scale_color_manual(
+    values = c("NS1 only test" = "blue", "NS1/IgM combo test" = "red"),
+    name = "Test"  
+  ) +
+  scale_size_continuous(name = "No. Samples") +      
+  theme_bw() +
+  theme(text = element_text(family = "Arial", size = 12)) +
+  ylab("Sensitivity (%)")
+
+```
+## Positive and Negative Percent Agreement with NS1 ELISA
+
+This section estimates the Positive Percent Agreement (PPA) and Negative Percent Agreement (NPA) between each rapid diagnostic test (RDT) and the NS1 ELISA reference standard. Samples with a Zika+ true status are excluded to avoid confounding by potential cross-reactivity. PPA is calculated among samples where NS1 ELISA is positive, reflecting the ability of the RDT to detect NS1-positive cases. NPA is calculated among samples where NS1 ELISA is negative, reflecting the ability of the RDT to correctly identify NS1-negative cases. Confidence intervals (95%) for the PPA and NPA are computed using the exact binomial method. The output table shows PPA and NPA values broken down by test target (Overall, NS1, IgM) and by RDT name. The raw table output is intended for further formatting and graphing if needed. This section generates Table 3 of the manuscript.
+
+```{r ns1elisapercentagreement}
+# Calculate PPA and NPA by RDT *and* target, excluding Zika+
+ppa_npa_table <- left_join(
+  
+  # Positive Percent Agreement (NS1_ELISA = Positive)
+  final_results %>%
+    filter(true_status != "Zika+") %>%         # <--- Exclude Zika+
+    filter(NS1_ELISA == "Positive") %>%
+    group_by(target, RDT) %>%
+    summarise(
+      TP = n(),
+      pos = sum(result == "Positive"),
+      .groups = "drop"
+    ) %>%
+    mutate(ci = epitools::binom.exact(pos, TP)) %>%
+    mutate(
+      proportion = round(ci$proportion, 2),
+      lower = round(ci$lower, 2),
+      upper = round(ci$upper, 2),
+      PPA = glue("{proportion} ({lower}-{upper})")
+    ) %>%
+    select(target, RDT, TP, PPA),
+  
+  # Negative Percent Agreement (NS1_ELISA = Negative)
+  final_results %>%
+    filter(true_status != "Zika+") %>%          # <--- Exclude Zika+
+    filter(NS1_ELISA == "Negative") %>%
+    group_by(target, RDT) %>%
+    summarise(
+      TN = n(),
+      neg = sum(result == "Negative"),
+      .groups = "drop"
+    ) %>%
+    mutate(ci = epitools::binom.exact(neg, TN)) %>%
+    mutate(
+      proportion = round(ci$proportion, 2),
+      lower = round(ci$lower, 2),
+      upper = round(ci$upper, 2),
+      NPA = glue("{proportion} ({lower}-{upper})")
+    ) %>%
+    select(target, RDT, TN, NPA),
+  
+  by = c("target", "RDT")
+)
+
+# View the table
+DT::datatable(ppa_npa_table, 
+              options = list(scrollX = TRUE), 
+              caption = "Table: PPA and NPA vs NS1 ELISA")
+```
+
+## Positive and Negative Percent Agreement with IgM ELISA
+
+This section estimates the Positive Percent Agreement (PPA) and Negative Percent Agreement (NPA) between each rapid diagnostic test (RDT) and the IgM ELISA reference standard. Samples with a Zika+ true status are excluded to avoid confounding by potential cross-reactivity. PPA is calculated among samples where IgM ELISA is positive, reflecting the ability of the RDT to detect IgM-positive cases. NPA is calculated among samples where IgM ELISA is negative, reflecting the ability of the RDT to correctly identify IgM-negative cases. Confidence intervals (95%) for the PPA and NPA are computed using the exact binomial method. The output table shows PPA and NPA values broken down by test target (Overall, NS1, IgM) and by RDT name. The raw table output is intended for further formatting and graphing if needed. This section generates Table 3 of the manuscript.
+
+```{r igmelisapercentagreement}
+# Calculate PPA and NPA compared to IgM_ELISA
+ppa_npa_table_igm <- left_join(
+  
+  # Positive Percent Agreement (IgM_ELISA = Positive)
+  final_results %>%
+    filter(true_status != "Zika+") %>%         # Exclude Zika+
+    filter(IgM_ELISA == "Positive") %>%
+    group_by(target, RDT) %>%
+    summarise(
+      TP = n(),
+      pos = sum(result == "Positive"),
+      .groups = "drop"
+    ) %>%
+    mutate(ci = epitools::binom.exact(pos, TP)) %>%
+    mutate(
+      proportion = round(ci$proportion, 2),
+      lower = round(ci$lower, 2),
+      upper = round(ci$upper, 2),
+      PPA = glue("{proportion} ({lower}-{upper})")
+    ) %>%
+    select(target, RDT, TP, PPA),
+  
+  # Negative Percent Agreement (IgM_ELISA = Negative)
+  final_results %>%
+    filter(true_status != "Zika+") %>%          # Exclude Zika+
+    filter(IgM_ELISA %in% c("Negative", "Equivocal")) %>%
+    group_by(target, RDT) %>%
+    summarise(
+      TN = n(),
+      neg = sum(result == "Negative"),
+      .groups = "drop"
+    ) %>%
+    mutate(ci = epitools::binom.exact(neg, TN)) %>%
+    mutate(
+      proportion = round(ci$proportion, 2),
+      lower = round(ci$lower, 2),
+      upper = round(ci$upper, 2),
+      NPA = glue("{proportion} ({lower}-{upper})")
+    ) %>%
+    select(target, RDT, TN, NPA),
+  
+  by = c("target", "RDT")
+)
+
+# View the IgM_ELISA agreement table
+DT::datatable(ppa_npa_table_igm, 
+              options = list(scrollX = TRUE), 
+              caption = "Table: PPA and NPA vs IgM ELISA")
+```
+
+## Cross-Reactivity with Zika Virus Positive Samples. 
+
+This section summarizes the number of Zika virus positive samples that produced a false positive result with each rapid diagnostic test (RDT). Only samples classified as Zika+ based on reference testing are included. The table reports the total number of Zika+ samples tested and the number of samples that tested positive by each RDT. The table breaks down results by test target (Overall, NS1, or IgM) and RDT. These results were used to populate Table 3 of the manuscript.
+
+```{r zikacrossreactivity}
+# Number of Zika+ samples that tested positive (no %)
+zika_pos_table <- final_results %>%
+  filter(true_status == "Zika+") %>%   # ✅ Only Zika+ samples
+  group_by(target, RDT) %>%
+  summarise(
+    n = n(),                           # Total Zika+ samples per test
+    pos = sum(result == "Positive"),   # Number of positive results among Zika+
+    .groups = "drop"
+  )
+
+# View the table
+DT::datatable(zika_pos_table, 
+              options = list(scrollX = TRUE), 
+              caption = "Table: False Positives among Zika+ Samples by RDT")
+```
+
+## Time-Adjusted Sensitivity and Specificity Estimates
+
+Here, we adjust the overall sensitivity and specificity estimates for each RDT based on the distribution of Days Post Onset (DPO) of symptoms in the sample population. The goal is to account for changes in diagnostic performance over time after symptom onset. The following adjustments are shown Unadjusted: Standard observed sensitivity and specificity among samples with DPO < 8 days, Uniform DPO adjustment: Assumes an equal distribution of samples across DPO 0–7, Surveillance-adjusted DPO: Weights the DPO distribution based on an external surveillance dataset (SEDSS distribution) to better reflect real-world patient presentations.This section generates Supplemental Figure 2 of the manuscript.
+
+```{r dpoadjustment}
+outdata <- data.frame()
+
+for(i in unique(final_results$RDT )){
+      
+      
+      fit_data <- final_results %>% filter(true_status=="DENV+") %>%
+      mutate(DPO=as.numeric(DPO)) %>%
+      filter(DPO<8) %>%
+      filter(RDT ==i) %>%
+      mutate(bin_result=ifelse(result=="Positive",
+                               1,0))
+
+      fit <- glm(formula = bin_result~splines::ns(DPO,3),
+                 data=fit_data,family = "binomial"
+                 )
+      
+      expit <- function(x) 1/(1+exp(-x)) 
+      
+      outdata <- bind_rows(outdata,
+                  data.frame(DPO=0:7) %>%
+                        bind_cols(as.data.frame(predict(fit,se.fit=TRUE,newdata=.))) %>%
+                        mutate(
+                              avg=expit(fit),
+                              lb=expit(fit-1.96*se.fit),
+                              ub=expit(fit+1.96*se.fit)) %>%
+            mutate(RDT =i,
+                   target=unique(fit_data$target)
+                   ))
+      
+
+}
+
+target_color_map <- c(
+  "Overall" = "#E41A1C",   
+  "NS1" = "#377EB8",             # blue
+  "IgM" = "#4DAF4A",             # green
+  "override_blue" = "#377EB8"    # force blue for the 3 override tests
+)
+
+target_label_map <- c(
+  "NS1" = "NS1 only test",
+  "IgM" = "IgM only test",
+  "Overall" = "NS1/IgM combo test"
+)
+
+override_tests <- c("Abbexa", "Biopanda", "InBios")
+
+###ns1 fit
+
+fit_data <- final_results %>% filter(true_status=="DENV+") %>%
+      mutate(DPO=as.numeric(DPO)) %>%
+      filter(DPO<8) %>%
+      distinct(CUID,DPO,NS1_ELISA)%>%
+      mutate(bin_result=ifelse(NS1_ELISA=="Positive",
+                               1,0))
+
+      fit <- glm(formula = bin_result~splines::ns(DPO,3),
+                 data=fit_data,family = "binomial"
+                 )
+      
+      expit <- function(x) 1/(1+exp(-x)) 
+      
+      ns1_outdata <- data.frame(DPO=0:7) %>%
+                        bind_cols(as.data.frame(predict(fit,se.fit=TRUE,newdata=.))) %>%
+                        mutate(
+                              avg=expit(fit),
+                              lb=expit(fit-1.96*se.fit),
+                              ub=expit(fit+1.96*se.fit)) 
+
+
+      
+sedss_dpo_distribution <- data.frame(
+      DPO= 0:7,
+      percent = c(0.048, 0.179, 0.168, 0.223, 0.168, 0.115, 0.076, 0.023)
+)
+
+crude_df <-final_results %>% filter(true_status=="DENV+") %>%
+      filter(DPO<8) %>%
+      group_by(test,target,RDT)%>%
+      summarize(sens=mean(result=="Positive") * 100)%>% 
+      mutate(type="Unadjusted") %>%
+  mutate(custom_target = ifelse(RDT %in% override_tests, "override_blue", target))
+      
+uniform_adjusted_df <- outdata %>%
+                  group_by(RDT) %>%
+                  summarise(sens=mean(avg) * 100) %>%
+      left_join(distinct(crude_df,RDT,test,target))%>% 
+      mutate(type="Adjusted: Uniform DPO") %>%
+  mutate(custom_target = ifelse(RDT %in% override_tests, "override_blue", target))
+      
+
+sedss_adjusted_df <- outdata %>%
+                  group_by(RDT) %>%
+                  left_join(sedss_dpo_distribution)%>%
+                  summarise(sens=sum(avg*percent) * 100) %>%
+      left_join(distinct(crude_df,RDT,test,target))%>% 
+      mutate(type="Adjusted: Surveillance DPOs") %>%
+  mutate(custom_target = ifelse(RDT %in% override_tests, "override_blue", target))
+
+      
+crude_ns1 <-final_results %>% filter(true_status=="DENV+") %>%
+      filter(DPO<8) %>%
+      distinct(CUID,NS1_ELISA)%>%
+      summarize(ns1=mean(NS1_ELISA=="Positive") * 100)%>% 
+      mutate(type="Unadjusted")
+
+uniform_adjusted_ns1 <- ns1_outdata %>%
+      summarize(ns1=mean(avg) * 100)%>% 
+      mutate(type="Adjusted: Uniform DPO")
+                        
+sedss_adjusted_ns1 <- ns1_outdata %>%
+      left_join(sedss_dpo_distribution)%>%
+                  summarise(ns1=sum(avg*percent) * 100)%>%
+      mutate(type="Adjusted: surveillance DPOs")
+      
+sens_plot <- bind_rows(crude_df, uniform_adjusted_df, sedss_adjusted_df) %>%
+  left_join(select(pretty_names, RDT, pretty_rdt)) %>%
+  ggplot() +
+  geom_col(aes(y = pretty_rdt, x = sens, fill = custom_target), 
+           position = position_dodge(preserve = "single")) +
+      facet_wrap(.~fct_rev(type))+
+      scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, by = 20)) +
+      theme_bw()+xlab("Sensitivity (%)")+ylab("Rapid Diagnostic Test") +
+      theme(text = element_text(family = "sans", size = 12)) +
+scale_fill_manual(
+  values = target_color_map,
+  breaks = c("Overall","NS1", "IgM" ),  # ✅ exclude "override_blue" from legend
+  labels = target_label_map,
+  name = "Target Type"
+) +
+  theme(
+    text = element_text(family = "Arial", size = 12),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    legend.position = "right"
+  )
+
+### specificity
+
+crude_spec_df <- final_results %>% filter(true_status=="Negative") %>%
+      group_by(test,target,RDT)%>%
+      summarize(spec=mean(result=="Negative"))%>% 
+      mutate(type="Unadjusted") %>%
+  mutate(custom_target = ifelse(RDT %in% override_tests, "override_blue", target))
+
+ns1_spec <- final_results %>% filter(true_status=="Negative") %>%
+      distinct(CUID,NS1_ELISA)%>%
+      summarize(ns1=mean(NS1_ELISA=="Negative"))%>% 
+      mutate(type="Unadjusted")
+
+spec_plot <- crude_spec_df %>%
+  mutate(custom_target = ifelse(RDT %in% override_tests, "override_blue", target)) %>%
+  left_join(select(pretty_names, RDT, pretty_rdt)) %>%
+  ggplot() +
+  geom_col(aes(y = pretty_rdt, x = spec, fill = custom_target), 
+           position = position_dodge(preserve = "single")) +
+      facet_wrap(.~fct_rev(type))+
+      theme_bw()+xlab("Specificity (%)")+ylab("Rapid Diagnostic Test") +
+      theme(text = element_text(family = "sans", size = 12)) +
+scale_fill_manual(
+  values = target_color_map,
+  breaks = c("Overall","NS1", "IgM"),  # ✅ exclude "override_blue" from legend
+  labels = target_label_map,
+  name = "Target Type"
+) +
+  theme(
+    text = element_text(family = "Arial", size = 12),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    legend.position = "right"
+  ) + theme(legend.position = "none")
+
+plot_grid(sens_plot,
+          plot_grid(spec_plot,ggplot() +theme_void(), rel_widths=c(1,0.95)),
+          ncol=1,
+          labels=c("A","B")
+          )
+
+```
+
+## Positive/Negative Predictive Values
+
+In this section, we use the overall sensitivity and specificity estimates for each RDT to calculate the Positive Predictive Value (PPV) and Negative Predictive Value (NPV) across a range of dengue prevalence values (0–50%). PPV and NPV were calculated at each 1% increment of prevalence using standard formulas. These results were used to generate Figure 4 of the manuscript.
+
+```{r ppvnpv}
+
+# 1. Start with your overall sensitivity and specificity table
+overall_sens_spec <- overall_t2  # You already have it
+
+# 2. Extract pure numeric sensitivity and specificity
+overall_clean <- overall_sens_spec %>%
+  mutate(
+    Sensitivity = as.numeric(str_extract(Sensitivity, "^\\d+")) / 100,
+    Specificity = as.numeric(str_extract(Specificity, "^\\d+")) / 100
+  )
+
+# 3. Define prevalence range (0 to 50%)
+prevalence_values <- seq(0, 0.5, by = 0.01)
+
+# 4. Define the function to calculate PPV and NPV
+calc_ppv_npv <- function(se, sp, prev) {
+  ppv <- (se * prev) / ((se * prev) + ((1 - sp) * (1 - prev)))
+  npv <- (sp * (1 - prev)) / (((1 - se) * prev) + (sp * (1 - prev)))
+  return(data.frame(Prevalence = prev, PPV = ppv, NPV = npv))
+}
+
+# 5. Expand across RDTs
+ppv_npv_table <- overall_clean %>%
+  group_by(RDT) %>%
+  do({
+    se <- .$Sensitivity
+    sp <- .$Specificity
+    bind_rows(lapply(prevalence_values, function(prev) calc_ppv_npv(se, sp, prev)))
+  }) %>%
+  ungroup()
+
+# 6. Make plots
+
+# PPV plot
+ggplot(ppv_npv_table, aes(x = Prevalence * 100, y = PPV, color = RDT)) +
+  geom_line() +
+  theme_bw() +
+  ylab("PPV") +
+  xlab("Prevalence (%)") +
+  ylim(0, 1) +
+  ggtitle("Positive Predictive Value (PPV) vs Prevalence")
+
+# NPV plot
+ggplot(ppv_npv_table, aes(x = Prevalence * 100, y = NPV, color = RDT)) +
+  geom_line() +
+  theme_bw() +
+  ylab("NPV") +
+  xlab("Prevalence (%)") +
+  ylim(0, 1) +
+  ggtitle("Negative Predictive Value (NPV) vs Prevalence")
+
+```
